@@ -1,0 +1,6 @@
+requests==2.34.2
+pandas==2.3.3
+duckdb==1.5.5
+pyarrow==25.0.0
+plotly==6.9.0
+pytest==9.1.1
