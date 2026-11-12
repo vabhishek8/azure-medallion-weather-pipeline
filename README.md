@@ -2,36 +2,20 @@
 
 [![pipeline](https://github.com/vabhishek8/azure-medallion-weather-pipeline/actions/workflows/pipeline.yml/badge.svg)](https://github.com/vabhishek8/azure-medallion-weather-pipeline/actions/workflows/pipeline.yml)
 
-A production-pattern **bronze → silver → gold** data pipeline that ingests
-daily weather for the five largest Australian capital cities, runs it
-through an explicit data-quality gate, computes rolling anomaly detection
-in SQL, and publishes a static analytics dashboard, orchestrated on a
-real schedule, not a one-off notebook run.
+Daily weather for the five largest Australian capital cities, run through a bronze, silver and gold pipeline on a real schedule. It pulls from Open-Meteo, checks the data at a quality gate, works out rolling anomalies in DuckDB SQL, and publishes a static dashboard.
 
 **[Live dashboard →](https://vabhishek8.github.io/azure-medallion-weather-pipeline/)**
 
-Built to answer one question honestly: what does an Azure Data Engineer's
-actual day-to-day judgment look like, end to end: ingestion failure
-handling, data quality gating, cost-aware architecture choices, IaC,
-testing, and CI, not just "wrote a SQL query."
+## Why I built it
 
----
+Most portfolio ETL projects load a CSV, run a query and stop. That doesn't show much. I wanted something that runs every day whether I'm watching or not, so I'd have to deal with the parts that make a pipeline hard to trust:
 
-## Why this project exists
+- the upstream API returning partial data for one city and not the others
+- who decides when raw data becomes trusted, and what happens when it shouldn't
+- which logic belongs in SQL and which belongs in application code
+- what this would cost to run properly in Azure, and how to stop it costing more than it should
 
-Most portfolio ETL projects are `load_csv() → run_query() → done`. That
-doesn't demonstrate anything a hiring manager can't already assume. This
-project is scoped instead around the decisions that actually separate a
-junior pipeline from a senior one:
-
-- What happens when the upstream API returns partial data for one city but not the others?
-- What's the contract between "raw" and "trusted" data, and who enforces it?
-- Where does SQL belong vs. where does application code belong?
-- What does this cost to run in production, and how do you avoid it costing more than it should?
-
----
-
-## Architecture
+## How it's wired
 
 ```mermaid
 flowchart LR
@@ -63,18 +47,34 @@ flowchart LR
     S --> G --> D --> DASH
 ```
 
-Orchestration is a scheduled GitHub Actions workflow (daily cron +
-on-push + manual dispatch): test job runs first, and the pipeline job
-only executes on green tests. A failed quality gate or a failed API call
-fails the run loudly, nothing downstream silently continues on bad data.
+A GitHub Actions workflow runs it daily, on every push to `main`, and on demand. The test job runs first, and the pipeline job only starts if the tests pass. If the quality gate or the API call fails, the run fails and nothing downstream carries on with bad data.
 
-## Production Azure mapping
+## What broke, and how it got caught
 
-The pipeline above runs on GitHub Actions + DuckDB because that's free
-and appropriately sized for 5 cities × 1 row/day. `infra/main.bicep`
-is the same design translated to a governed Azure estate: this is what
-changes (and what doesn't) going from a portfolio-scale pipeline to a
-production one:
+I started on Open-Meteo's forecast endpoint, using its `past_days` parameter. Past a short lookback, it returns sparse or null daily values for humidity and a few other fields. The null check in `src/quality_checks.py` flagged it on the first runs. The warnings were right, so I changed the source rather than loosening the check. Bronze now pulls from the archive endpoint (ERA5 reanalysis), which returns complete daily values with roughly a one-day lag. That's why ingestion always asks for data up to yesterday, not today.
+
+The quality gate runs before every silver write:
+
+- every required column is present
+- nulls in `city` or `date` are errors, and nulls anywhere else are warnings
+- each field stays inside physically plausible bounds
+- no duplicate `(city, date)` rows
+- the maximum temperature is never below the minimum
+
+If an error-level check fails, the write is aborted with a structured report, and nothing reaches gold.
+
+## Gold layer
+
+DuckDB SQL over the silver Parquet file. It's the same execution model as querying ADLS Gen2 through Synapse Serverless SQL.
+
+- `temp_anomaly_c` and `temp_anomaly_zscore`: distance from a 30-day trailing mean and standard deviation, as window functions
+- `is_extreme_heat`: maximum temperature at or above the 95th percentile of the trailing 90 days
+- `rain_flag`: a wet or dry day
+- a city summary: averages, peaks and the count of extreme-heat days
+
+## The Azure version, and why it isn't running
+
+This runs on GitHub Actions and DuckDB because that's free and right-sized for five cities and one row per city per day. `infra/main.bicep` is the same design written for a governed Azure estate:
 
 ```mermaid
 flowchart LR
@@ -92,7 +92,7 @@ flowchart LR
     ADF --> LAW --> ALERT
 ```
 
-Deliberate choices, not defaults:
+The calls I made, and why:
 
 | Decision | Reasoning |
 |---|---|
@@ -102,7 +102,7 @@ Deliberate choices, not defaults:
 | Not deployed and left running | A standing ADF + Synapse estate for a 5-row/day dataset has real, ongoing cost with no proportional benefit. Deploy on demand, validate, tear down: the template is the deliverable, not a permanently running resource. |
 | Metric alert on `PipelineFailedRuns` → email | A failed pipeline that nobody notices until a dashboard looks stale is a monitoring gap, not just a missing feature. |
 
-Deploy it yourself:
+Validated with `bicep build` (0 errors). To deploy it yourself:
 
 ```bash
 az deployment group create \
@@ -111,33 +111,7 @@ az deployment group create \
   --parameters environment=dev alertEmail=you@example.com
 ```
 
-Validated with `bicep build` (0 errors); see `infra/main.bicep` for the full template (storage, ADF, Synapse, Key Vault, Log Analytics, alerting, RBAC role assignments).
-
----
-
-## Data quality gate
-
-Every silver write goes through `src/quality_checks.py` before it's
-persisted: schema completeness, null thresholds, physically-plausible
-range bounds per field, duplicate `(city, date)` detection, and
-max/min-temperature consistency. A failing check aborts the write with a
-structured report; nothing gets to gold un-validated. This isn't
-decorative. It's what caught a real bug during development: Open-Meteo's
-*forecast* endpoint returns sparse humidity data beyond a short lookback
-window, which showed up as quality warnings and drove the switch to the
-*archive* (reanalysis) endpoint used today.
-
-## Gold-layer analytics
-
-Computed in DuckDB SQL over the silver Parquet file (same execution model
-as querying ADLS Gen2 via Synapse Serverless SQL):
-
-- `temp_anomaly_c` / `temp_anomaly_zscore`: deviation from a 30-day trailing mean/stddev, computed as a window function
-- `is_extreme_heat`: max temp ≥ 95th percentile of a trailing 90-day window
-- `rain_flag`: binary wet/dry day
-- City-level summary: averages, peaks, extreme-heat day counts
-
-## Running locally
+## Running it locally
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -164,8 +138,8 @@ infra/main.bicep       production Azure IaC (ADF, ADLS Gen2, Synapse, Key Vault,
 
 ## Stack
 
-Python · pandas · DuckDB · Plotly · pytest · GitHub Actions · Bicep (Azure Data Factory, ADLS Gen2, Synapse Serverless SQL, Key Vault, Log Analytics, Application Insights)
+Python, pandas, DuckDB, Plotly, pytest and GitHub Actions. The Bicep covers Azure Data Factory, ADLS Gen2, Synapse Serverless SQL, Key Vault, Log Analytics and Application Insights.
 
 ---
 
-Built by [Abhishek Vadlamudi](https://abhishekvadlamudi.com), Senior BI Engineer positioning toward Azure Data Engineering.
+Built by [Abhishek Vadlamudi](https://abhishekvadlamudi.com), Senior Business Intelligence Engineer at Unisys in Sydney.
