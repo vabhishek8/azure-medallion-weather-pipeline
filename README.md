@@ -49,7 +49,7 @@ flowchart LR
     end
 
     subgraph GOLD["Gold (analytics)"]
-        G["DuckDB SQL<br/>30d rolling avg + z-score<br/>90th pct extreme-heat flag"]
+        G["DuckDB SQL<br/>30d rolling avg + z-score<br/>extreme-heat flag: ≥ 95th percentile (trailing 90 days)"]
         D["weather_gold.parquet<br/>city_summary.parquet"]
     end
 
@@ -118,7 +118,7 @@ Validated with `bicep build` (0 errors); see `infra/main.bicep` for the full tem
 ## Data quality gate
 
 Every silver write goes through `src/quality_checks.py` before it's
-persisted: schema completeness, null thresholds, physically-plausible
+persisted: schema completeness, null checks (a null city or date fails the gate; nulls in measure columns are warnings), physically-plausible
 range bounds per field, duplicate `(city, date)` detection, and
 max/min-temperature consistency. A failing check aborts the write with a
 structured report; nothing gets to gold un-validated. This isn't
