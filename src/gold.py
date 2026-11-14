@@ -7,7 +7,7 @@ production target this pipeline is designed to map onto (see infra/main.bicep).
 
 Gold answers three analytical questions per city/day:
   1. temp_anomaly_c   -- deviation of max temp from a 30-day trailing mean
-  2. is_extreme_heat   -- max temp > 95th percentile of trailing 90-day window
+  2. is_extreme_heat   -- max temp ≥ 95th percentile of trailing 90-day window
   3. rain_flag         -- binary wet/dry day
 """
 from __future__ import annotations
